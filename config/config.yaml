@@ -1,0 +1,865 @@
+# ==============================================================================
+# SORT-tendance :: Central Reference Registry (config.yaml)
+# ==============================================================================
+# Single Source of Truth for all runtime parameters across the entire pipeline.
+# No hardcoded variables are permitted in any application source file; every
+# execution loop must pull values directly from this registry.
+#
+# Hardware Target:
+#   - CPU: Intel Core i9 14th Gen (24 Cores / 32 Threads)
+#   - GPU: NVIDIA GeForce RTX 4060 (8 GB GDDR6)
+#   - RAM: 128 GB DDR5
+#   - OS:  Windows Server 2022 / Windows 11 Pro (native)
+#
+# Resource Budgeting Paradigm:
+#   This single instance is permitted to consume AT MOST 25% of total system
+#   resources. The GPU memory fraction is hard-locked at 0.22 (~1.76 GB VRAM),
+#   and CPU cores are pinned via psutil.Process().cpu_affinity() masks to a
+#   dedicated physical core block to prevent context-switching thrash.
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. HARDWARE RESOURCE SCOPES
+# ------------------------------------------------------------------------------
+hardware:
+  gpu:
+    device_id: 0
+    # 8 GB total VRAM * 0.22 fraction = 1.76 GB hard cap (~1,890,516,173 bytes).
+    # Passed as `gpu_mem_limit` (bytes) into CUDAExecutionProvider session options.
+    memory_fraction: 0.22
+    total_vram_bytes: 8589934592              # 8 GB expressed in bytes
+    # `gpu_mem_limit` is computed dynamically in code, but the explicit
+    # fallback ceiling is provided here for diagnostics and offline checks.
+    mem_limit_bytes: 1890516173
+    enable_cuda_graph: false                  # Disabled: input shapes are dynamic
+    arena_extend_strategy: "kSameAsRequested" # Prevents VRAM overcommit
+    cudnn_conv_algo_search: "EXHAUSTIVE"      # Lock optimal conv kernel during warmup
+    enable_mem_pattern: true                  # Stable input shapes post-warmup
+    do_copy_in_default_stream: true
+    use_ep_level_unified_stream: true
+
+  cpu:
+    # Quad-thread pinning. Each pipeline thread is bound to a dedicated
+    # physical core block to avoid SMT collision latency.
+    # i9 14th Gen layout (P-Cores 0..15, E-Cores 16..23, threads 24..31 are SMT).
+    # We reserve the P-Core block [0..7] for the SORT-tendance instance.
+    physical_cores_total: 24
+    logical_threads_total: 32
+    affinity_masks:
+      main_orchestrator:   [0, 1]             # GUI + dispatcher
+      capture_thread:      [2, 3, 4, 5]       # DirectShow MJPEG ingestion
+      ai_inference_thread: [4, 5, 6, 7]       # YOLO + BoTSORT + InsightFace
+      dashboard_process:   [18, 19]           # Streamlit UI (E-Cores OK)
+    enable_affinity_lock: false
+
+  memory:
+    system_ram_bytes: 137438953472            # 128 GB
+    process_ram_ceiling_bytes: 34359738368    # 25% hard cap = 32 GB
+    gc_aggressive_threshold: 0.65             # gc.collect when heap > 65% of cap
+
+# ------------------------------------------------------------------------------
+# 2. CAMERA DEVICE CONTEXTS
+# ------------------------------------------------------------------------------
+camera:
+  # --------------------------------------------------------------------------
+  # Backend selection :: CAP_DSHOW (DirectShow)
+  # --------------------------------------------------------------------------
+  # Benchmark results on this hardware (1280x720 @ 50 FPS, MJPG):
+  #
+  #   CAP_MSMF  -> 59.95 FPS, p95=34.17 ms, BUT focus control is a silent
+  #                no-op (OpenCV's MSMF backend does not wire
+  #                CAP_PROP_FOCUS / CAP_PROP_AUTOFOCUS to Media Foundation).
+  #   CAP_DSHOW -> 57.39 FPS, p95=35.80 ms, AND focus control works
+  #                (verified set/readback for values 0..255; range 0..1023).
+  #
+  # The ~2.6 FPS loss vs MSMF is negligible; the working focus control is
+  # essential for fixed-focus attendance scenarios where the camera must
+  # NOT hunt for focus every time a person walks through frame.
+  # --------------------------------------------------------------------------
+  backend: "CAP_DSHOW"
+  device_index: 0
+  width: 1280
+  height: 720
+  display_width: 1280
+  display_height: 720
+  target_fps: 50
+
+  # MJPEG FourCC is REQUIRED for high-FPS DirectShow at 1280x720.
+  # Without it, the driver falls back to YUY2 (uncompressed) and the
+  # stream is bandwidth-limited to ~11 FPS over USB 2.0.
+  #
+  # IMPORTANT: main.py sets properties in the order W -> H -> FPS -> FOURCC.
+  # Setting FOURCC before FPS/DIMENSIONS causes DSHOW to ignore the MJPG
+  # override and silently select YUY2. See main.py::_open_capture() for
+  # the exact ordering contract.
+  fourcc: "MJPG"
+
+  # --------------------------------------------------------------------------
+  # Focus control (DirectShow only -- MSMF silently ignores these).
+  # --------------------------------------------------------------------------
+  # autofocus: false  ->  disable continuous AF; lens holds the fixed
+  #                      position specified by `focus` below.
+  # autofocus: true   ->  let the driver's AF loop hunt continuously
+  #                      (NOT recommended for attendance scenarios;
+  #                      causes periodic bbox-scale jitter when subjects
+  #                      approach the lens).
+  #
+  # focus: 0..1023    ->  fixed focus position. On this driver, value 0
+  #                      disables autofocus and locks the lens at the
+  #                      nearest focal plane. Higher values pull focus
+  #                      progressively further away. Set this to a value
+  #                      that is sharp for the camera's typical working
+  #                      distance (e.g. entry door, attendance desk).
+  #                      If unsure, leave at 0 and verify visually.
+  # --------------------------------------------------------------------------
+  autofocus: false
+  focus: 0
+
+  # Patch 46 :: buffer_size and auto_exposure are intentionally absent.
+  # Touching CAP_PROP_BUFFERSIZE>1 or CAP_PROP_AUTO_EXPOSURE on Windows
+  # DShow / MSMF frequently triggers silent FPS degradation (driver AE
+  # loop, slower polling). Hardware driver may silently degrade FPS;
+  # main.py verifies actual rate over fps_verify_window_ms.
+  # Patch 61 :: cut from 2000 to 250 -- 10 frames at 50fps is
+  # enough to confirm FPS. The 2000ms default delayed the first
+  # frame reaching the AI queue by 2 seconds, which was the
+  # single biggest cold-start TTFM regression.
+  fps_verify_window_ms: 250
+  flip_horizontal: false
+  flip_vertical: false
+
+# ------------------------------------------------------------------------------
+# 3. INSIGHTFACE NATIVE PARAMETERS
+# ------------------------------------------------------------------------------
+insightface:
+  # ---------------------------------------------------------------------------
+  # ONLY detection (det_10g) and recognition (w600k_r50) modules are loaded.
+  # All landmark/gender/age overhead is explicitly stripped at instantiation.
+  # ---------------------------------------------------------------------------
+  root_dir: "models/insightface"              # Bundled model directory
+  # `pack_name` selects the model pack directory under <root_dir>/models/.
+  # "buffalo_l" = standard pack containing det_10g + w600k_r50 + landmark
+  # helpers + genderage (the extras are stripped at load time via
+  # allowed_modules=["detection","recognition"]).
+  # Use "antelopev2" only if you have that pack's ONNX files on disk.
+  pack_name: "buffalo_l"
+  detection_module: "det_10g.onnx"
+  recognition_module: "w600k_r50.onnx"
+  enable_landmark_106: false                  # STRIPPED
+  enable_gender_age: false                    # STRIPPED
+  enable_mask_detection: false                # STRIPPED
+  enable_face_swap: false                     # STRIPPED
+  ctx_id: 0                                   # GPU device ordinal
+  det_size: [320, 320]                        # Reduced from 640 for 4x speedup
+  rec_size: [112, 112]                        # ArcFace standard template
+  # Detection thresholds (InsightFace default 0.5 / 0.5 / 0.5).
+  det_thresh: 0.5
+  nms_thresh: 0.4
+  # Per-frame detection ceiling to bound inference time.
+  max_faces_per_frame: 8
+  # Embedding dimension for w600k_r50 = 512.
+  embedding_dim: 512
+
+# ------------------------------------------------------------------------------
+# 4. TRACKING PARAMETERS (YOLO + BoTSORT)
+# ------------------------------------------------------------------------------
+tracking:
+  yolo:
+    weights: "models/yolov8n.pt"
+    device: "cuda:0"
+    # Patch 10: Lowered from 640 -> 480. Ultralytics letterbox-resizes
+    # the input frame to imgsz internally and rescales bboxes back to
+    # source coordinates, so NO code change is required in tracking_engine.py.
+    # Compute cost scales as imgsz^2 -> 480^2 / 640^2 = 0.5625 (~44% less
+    # YOLO GPU time). Frees GPU cycles for the face detector and reduces
+    # face_det_latency from ~166ms to ~30-50ms.
+    imgsz: 480
+    conf_threshold: 0.35
+    iou_threshold: 0.55
+    # Person class only (COCO idx 0).
+    target_classes: [0]
+    half_precision: true                      # FP16 on Tensor Cores
+    verbose: false
+
+  botsort:
+    # BoTSORT tracker config (Ultralytics defaults overridden).
+    track_buffer: 30                          # Frames to keep lost tracks
+    match_thresh: 0.8
+    proximity_thresh: 0.5
+    appearance_thresh: 0.25
+    new_track_thresh: 0.5
+    # Patch 64 (hotfix M) :: GMC disabled.
+    # The previous value "sparseOptFlow" caused intermittent
+    # 0xC0000005 (access violation) crashes inside
+    # ultralytics/trackers/utils/gmc.py:apply_sparseoptflow ->
+    # cv2.calcOpticalFlowPyrLK. The LK optical flow routine accesses
+    # prev_frame / prev_pts memory that can be invalidated between
+    # frames when the OpenCV build's internal buffer is recycled,
+    # especially under high FPS + PyTorch GPU contention.
+    #
+    # GMC (Global Motion Compensation) is ONLY useful for MOVING
+    # cameras (drones, vehicle cams, PTZ). For a static classroom /
+    # hallway attendance camera, GMC is unnecessary -- the camera
+    # doesn't move, so there is no global motion to compensate for.
+    # Setting it to "none" routes through GMC.apply_none() which
+    # returns an identity matrix (no-op), completely bypassing the
+    # crashing code path.
+    #
+    # This is the documented fix for the access violation at:
+    #   ultralytics/trackers/utils/gmc.py line 311 in apply_sparseoptflow
+    #   ultralytics/trackers/byte_tracker.py line 353 in _pre_first_associate
+    cmc_method: "none"
+    gmc_file: ""
+    # Identity lock trigger when two person bboxes overlap heavily.
+    iou_lock_threshold: 0.7                   # If IoU > 0.7 -> identity_locked = True
+
+  warmup:
+    # Pre-warm CUDA NMS / Kalman paths with synthetic frames at startup.
+    blank_passes: 2
+    noise_passes: 4
+
+# ------------------------------------------------------------------------------
+# 5. VECTOR SEARCH SCHEMAS (USEARCH)
+# ------------------------------------------------------------------------------
+vector_search:
+  metric: "cos"                               # Cosine similarity (usearch 2.x name; was 'cosinesimil' in Faiss/older usearch)
+  embedding_dim: 512                          # ArcFace w600k_r50
+  reid_dim: 512                               # OSNet AIN x1_0
+  # Static DB index grows only at enrollment time.
+  static_db:
+    rebuild_on_init: true
+    connect_capacity: 4096
+  # Dynamic stranger appearance cache, bounded history.
+  dynamic_cache:
+    max_capacity: 256                         # Per-session ceiling
+    history_per_track: 10                     # body_history_size
+    eviction_policy: "lru"
+
+# ------------------------------------------------------------------------------
+# 6. IDENTITY MATCHING & RE-ID
+# ------------------------------------------------------------------------------
+identity_matcher:
+  reid:
+    weights: "models/osnet_ain_x1_0.pth"
+    device: "cuda:0"
+    input_dim: [3, 256, 128]                  # OSNet native input shape
+    batch_warmup_sizes: [1, 2, 4, 8]          # CUDA Graph pre-compilation
+    # Pre-allocated VRAM workspace for OSNet forward.
+    fixed_workspace_shape: [8, 3, 256, 128]
+    imagenet_mean: [0.485, 0.456, 0.406]
+    imagenet_std:  [0.229, 0.224, 0.225]
+
+  hybrid_reid:
+    body_history_size: 10
+    spatial_distance_limit_px: 150
+    body_similarity_threshold: 0.70
+
+  batch_match:
+    # Parallel BLAS routine: live_matrix @ db_matrix.T
+    enable_chunking: true
+    chunk_size: 64                            # Limit peak GPU mem for large DBs
+
+# ------------------------------------------------------------------------------
+# 7. GATING STATES (State Machine Engine)
+# ------------------------------------------------------------------------------
+gating:
+  # Strict state cascades. Once a track reaches a resolved state, it is
+  # permanently locked and removed from active scanning.
+  verified_student:
+    # Patch 29 :: similarity_baseline lowered from 0.65 -> 0.60 to match
+    # the backtest's relaxed floor validated via
+    # `python vector_backtest.py --threshold 0.60`. A single
+    # high-confidence frame (sim >= 0.60) can now verify a student
+    # without needing TTFM relaxation. The dynamic_floor is also
+    # lowered to 0.55 so the TTFM relaxation window still provides
+    # headroom below the new 0.60 baseline (without this, relaxation
+    # would be a no-op since dynamic_floor == baseline).
+    similarity_baseline: 0.60                 # Strict baseline verification
+    similarity_dynamic_floor: 0.55            # TTFM relaxation floor
+    enable_dynamic_relaxation: true
+    relaxation_window_frames: 30
+    # Pose-Weighted EMA Accumulator.
+    pose_ema:
+      base_alpha: 0.4
+      pose_weight_frontal: 1.0
+      pose_weight_profile_floor: 0.25
+      accumulation_threshold: 0.62
+      min_cluster_size: 4
+    # TTFM Tracker.
+    ttfm:
+      window_size: 6
+      hits_required: 3
+      hit_similarity: 0.60
+
+  stranger:
+    # Patch 58 :: Lowered from 0.55 -> 0.50 per operator request
+    # ("graceful threshold between 0.4-0.6"). Only truly dissimilar
+    # faces (similarity < 0.50) trigger the stranger path. Faces in
+    # the 0.50-0.60 gray zone get extra scanning frames (via
+    # pending_threshold=30) before being declared stranger. This
+    # fixes false-positive stranger calls at 2-3m distance where
+    # OSNet embedding noise can dip similarity to 0.52-0.55.
+    similarity_floor: 0.50
+    sequential_naming: "Stranger_{:02d}"
+    # Once flagged as Stranger -> all face scanning HALTED for that track.
+    halt_face_scanning_on_lock: true
+    # Dynamic appearance cache index lookup threshold.
+    appearance_inherit_threshold: 0.60
+    # Patch 30 :: Number of consecutive sub-threshold face-similarity
+    # frames required before a track is locked as STRANGER. Was a
+    # hard-coded class attribute (3) in gating_opt.py; now configurable.
+    # Patch 35 :: Raised from 8 -> 30 per operator request ("more
+    # graceful"). At 25-50 FPS face-scan rates this means a track
+    # must remain sub-threshold for ~600-1200 ms before being
+    # declared a stranger -- long enough to ride out sustained
+    # occlusions, motion blur, partial-profile frames, and brief
+    # head-turns without spuriously locking strangers.
+    # Patch 58 :: Raised from 20 -> 30 per operator request ("longer
+    # threshold to verify stranger" + "judging too fast for it
+    # detected as strangers"). At 25-50 FPS face-scan rates this
+    # means a track must remain sub-threshold for ~1200-2400 ms
+    # before being declared a stranger -- ~2x more grace for
+    # distance/blur/profile cases at 2-3 meters.
+    pending_threshold: 30
+    # Patch 37 :: YOLO confidence gates for stranger operations.
+    # The OSNet body appearance embedding is only reliable when the
+    # YOLO bbox is accurate. When det_conf is low (partial occlusion,
+    # motion blur, small/distant bbox), the crop includes background
+    # pixels and the embedding becomes noisy -- producing false-
+    # positive Re-ID matches (the "two different people both became
+    # Stranger_02" bug).
+    #
+    # snapshot_min_yolo_conf: only capture stranger snapshots (birth
+    #   + finalized) when det_conf >= this value. Low-conf snapshots
+    #   are skipped (they'd be unusable anyway).
+    # reid_min_yolo_conf: only do Re-ID inheritance check + cache
+    #   registration when det_conf >= this value. Below this, the
+    #   stranger gets a new ID but the embedding is NOT added to the
+    #   cache (prevents future false-positive inheritances).
+    snapshot_min_yolo_conf: 0.50
+    reid_min_yolo_conf: 0.50
+
+  anomaly:
+    # Face detected WITHOUT corresponding body bbox from tracking engine.
+    force_burst_mode: true
+    label: "ANOMALY"
+    log_to_csv: true
+
+  identity_lock:
+    # Global container `attendance_final_log` in RAM.
+    enable_global_lock: true
+    reid_inheritance_enabled: true            # verified_nrp_state inheritance
+
+# ------------------------------------------------------------------------------
+# 8. RESOURCE OPTIMIZATION ENGINE
+# ------------------------------------------------------------------------------
+res_opt:
+  idle_mode:
+    enable: true
+    sleep_ms: 40                              # Hard 25 FPS cap (40 ms)
+    gpu_duty_cycle_target: 0.25               # Keep GPU duty < 50% to prevent throttling
+  burst_mode:
+    enable: true
+    sleep_ms: 0                               # Full throughput
+  velocity_aware_crop_boost:
+    enable: true
+    min_lateral_velocity_px_per_frame: 3.0
+    small_face_width_threshold_px: 40
+    upscale_factor: 4
+    interpolation: "INTER_CUBIC"              # Bicubic
+  # Patch 13: Adaptive YOLO interval. When ResOptEngine decides IDLE
+  # mode (all tracks are VERIFIED or STRANGER-locked, face scanning
+  # halted), we skip the YOLO+BoTSORT inference call on N-1 of every
+  # N frames and reuse the cached track boxes. BoTSORT track_buffer=30
+  # keeps lost tracks alive for 30 frames, so a 3-frame cycle is well
+  # within safety. New track births force BURST (via Patch 7), which
+  # automatically disables skipping and re-engages YOLO.
+  adaptive_yolo_interval:
+    enable: true
+    interval: 3                               # Run YOLO every 3rd frame in IDLE mode
+    # When skipping YOLO, the renderer draws the cached boxes from the
+    # last YOLO frame. Stale by at most (interval-1) * cycle_ms.
+    # For interval=3 at IDLE 25fps target (40ms sleep), max staleness = 80ms.
+
+# ------------------------------------------------------------------------------
+# 9. ASYNC LOGGER
+# ------------------------------------------------------------------------------
+async_logger:
+  log_dir: "storage/logs"
+  daily_csv_prefix: "attendance_"
+  # Comprehensive column schema. Combines the user-mandated audit headers
+  # (NRP, Student Name, Status, State, Hardware Capture Index, Precision
+  # Timestamp Microseconds, Match Similarity) with the spatial bbox fields
+  # required by the dashboard and forensic review tooling.
+  csv_columns:
+    - "timestamp_us"                          # Precision Timestamp Microseconds (bbox generation instant)
+    - "frame_index"                           # Hardware Capture Index (monotonic frame counter)
+    - "track_id"                              # Internal, NOT rendered on video feed
+    - "nrp"                                   # Student NRP identifier (empty for STRANGER / ANOMALY)
+    - "student_name"                          # Student Name (empty for STRANGER / ANOMALY)
+    - "resolved_label"                        # Status: [NRP / Name] | [Stranger_XX] | [ANOMALY]
+    - "state"                                 # State: VERIFIED_STUDENT | STRANGER | ANOMALY
+    - "similarity_score"                      # Match Similarity (cosine, 0.0 - 1.0)
+    - "bbox_x1"
+    - "bbox_y1"
+    - "bbox_x2"
+    - "bbox_y2"
+    - "yolo_latency_ms"                       # YOLOv8 + BoTSORT inference time
+    - "face_det_latency_ms"                   # InsightFace det_10g (empty if face scan skipped)
+    - "arcface_latency_ms"                    # InsightFace w600k_r50 + alignment (empty if skipped)
+    - "usearch_latency_ms"                    # USearch top-k cosine query (empty if skipped)
+    - "ttfm_ms"                               # Time-To-First-Match (VERIFIED_STUDENT only)
+    - "body_reid_latency_ms"                  # Patch 42 :: OSNet body Re-ID inference time (per-frame batch)
+
+  anti_spam_cache_size: 256                   # Per-session dedup memory
+  anti_spam_session_ttl_s: 3600               # Per-session dedup TTL (1 hour)
+  queue_maxsize: 1024
+  flush_interval_ms: 500
+  # Anti-spam dedup key: 'student_id' for VERIFIED_STUDENT, 'stranger_label'
+  # for STRANGER. ANOMALY events are never deduplicated (each is a unique
+  # security incident).
+  anti_spam_dedup_states: ["VERIFIED_STUDENT", "STRANGER"]
+
+# ------------------------------------------------------------------------------
+# 10. STRANGER SNAPSHOT ENGINE (replaces VIDEO RECORDER)
+#    Captures ONE PNG per stranger event (at track birth) instead of
+#    continuously encoding H.264 video. Saves ~331 MB RAM, ~25 disk
+#    writes/sec, and 1 NVENC duty cycle.
+# ------------------------------------------------------------------------------
+snap_strangers:
+  output_dir: "storage/snap_strangers"       # PNG snapshot output directory
+  retention_hours: 72                         # Soft shelf-life (used only if purge_enabled=true)
+  purge_check_interval_s: 300                 # PurgeWorker scan cadence
+  png_compression: 6                          # 0=none, 9=max (6 is a good balance)
+  queue_maxsize: 64                           # Worker queue depth (rarely fills)
+  # Patch 18+20 :: PurgeWorker is DISABLED by default. The operator
+  # explicitly requested that snap_strangers NOT purge any files --
+  # snapshots are retained indefinitely, organized by date+session
+  # folder, and browsable via the dashboard. Only the OSNet
+  # re-identification feature gallery is reset every 06:00 / 18:00
+  # (handled by identity_matcher.reset_dynamic_memory(), called from
+  # main.py's SessionBoundaryWatcher).
+  purge_enabled: false
+  # Patch 63 :: Verified-student snapshot retention. When true,
+  # finalize_verified() MOVES the birth PNG into the identified/
+  # subfolder instead of deleting it. This preserves the snapshot
+  # for the Event Log page's hourly history view.
+  retain_verified_snapshots: true
+  identified_subdir: "identified"
+  # Patch 63 (hotfix K) :: Unresolved birth snapshot retention.
+  # When a track exits the frame WITHOUT being resolved (neither
+  # verified nor locked as stranger), prune_dead_tracks() is called
+  # to clean up the pending path. Previously, it also DELETED the
+  # BIRTH.png from disk -- which meant brief walk-throughs (person
+  # appears for <30 frames, leaves before the pending_threshold is
+  # reached) left NO trace on disk.
+  #
+  # When prune_unresolved_births=false (default), the BIRTH.png is
+  # KEPT on disk and appears in the dashboard as "Pending_Track_NN".
+  # This lets operators review EVERYONE who appeared, even briefly.
+  # The _pending_paths dict entry is still removed (so it doesn't
+  # grow unbounded), but the file stays.
+  #
+  # When prune_unresolved_births=true, the old behavior is restored
+  # (BIRTH.png is deleted from disk). Only use this if disk space
+  # is a concern and brief walk-throughs are not forensically useful.
+  prune_unresolved_births: false
+  # --------------------------------------------------------------------------
+  # Patch 65 :: CLEARSHOT snapshots for STRANGER-locked tracks.
+  #
+  # After a track is locked as STRANGER, the AI thread periodically
+  # captures an additional "clearshot" PNG when:
+  #   * YOLO det_conf >= clearshot.min_yolo_conf (default 0.70)
+  #   * bbox width AND height >= clearshot.min_bbox_size (default 80px)
+  #   * cooldown_s elapsed since the last clearshot for this track
+  #   * per-track count < max_per_track
+  #
+  # These clearshots serve as OSNet "memory recall" reference frames.
+  # Each one is a clean, high-confidence capture that operators (and a
+  # downstream OSNet re-extraction pipeline) can use as an additional
+  # body-feature reference for the same stranger.
+  #
+  # Filename format:
+  #   {ts_ms}_track{tid}_STRANGER_{label}_CLEARSHOT_{YY:02d}.png
+  #
+  # YY is a per-stranger counter (01, 02, 03, ...) that guarantees
+  # unique filenames even if multiple clearshots are captured within
+  # the same second. The counter resets at every 06:00 / 18:00 session
+  # boundary (alongside the OSNet dynamic memory reset).
+  #
+  # Clearshots are filed under:
+  #   {output_dir}/{YYYY-MM-DD}/{6AM Session|6PM Session}/clearshots/
+  # --------------------------------------------------------------------------
+  clearshot:
+    enabled: true
+    # YOLO person confidence threshold. When the tracked person's
+    # det_conf >= this value AND the track is locked as STRANGER, a
+    # clearshot is captured (subject to cooldown + max_per_track).
+    # Default 0.70 = high-quality bbox (vs 0.50 for birth snapshots,
+    # which fire on any track birth regardless of bbox quality).
+    # Raising this to 0.80+ reduces clearshot volume (only the
+    # sharpest captures); lowering to 0.60 increases volume.
+    min_yolo_conf: 0.70
+    # Minimum bbox width AND height in pixels. Smaller bboxes mean the
+    # person is far from the camera -- the snapshot would be too low
+    # resolution to be a useful OSNet reference. 80px is roughly the
+    # minimum at which OSNet can extract a discriminative 512-dim
+    # feature vector (smaller crops produce noisy embeddings).
+    # At 1280x720 frame + 480x480 YOLO imgsz, an 80px person bbox
+    # corresponds to ~6m distance from the camera.
+    min_bbox_size: 80
+    # Cooldown between clearshots for the SAME track, in seconds.
+    # Prevents spamming snapshots when a stranger stands in frame.
+    # 30s = max 2 clearshots/min, 120/hour per stranger.
+    # For a 12-hour session with one persistent stranger: 30s cooldown
+    # * 12h = 1440 clearshots -- well above max_per_track=20, so the
+    # max_per_track cap is the effective limiter.
+    cooldown_s: 30.0
+    # Maximum clearshots per stranger track. Prevents disk spam for
+    # long-running strangers. 20 clearshots/stranger is enough for
+    # OSNet re-extraction pipelines to build a robust feature gallery.
+    # 0 = unlimited (NOT recommended -- a stranger standing in frame
+    # for 6 hours at 30s cooldown = 720 clearshots = ~150 MB PNG/stranger).
+    max_per_track: 20
+    # Subfolder name (under the session folder) where clearshots are
+    # filed. If empty ("") they're written alongside birth snapshots.
+    # Using a dedicated subfolder keeps the main session folder clean
+    # and lets the dashboard filter clearshots separately.
+    subdir: "clearshots"
+
+# ------------------------------------------------------------------------------
+# 10b. STRANGER OSNET MEMORY RECALL
+# ------------------------------------------------------------------------------
+# On every process restart (12-hour scheduled restart at 6AM/6PM, or
+# mid-session crash recovery), the system rebuilds an IN-MEMORY stranger
+# OSNet embedding vector from the clearshot PNGs saved on disk. This
+# lets the tracker "remember" strangers across restarts within the same
+# session.
+#
+# FLOW:
+#   1. Scan the current session's clearshot directory:
+#        storage/snap_strangers/{YYYY-MM-DD}/{6AM Session|6PM Session}/clearshots/
+#   2. ALSO, if current session is 6PM, scan today's 6AM session (carries
+#      morning strangers into the evening session). At 6AM (new day), do
+#      NOT scan yesterday's 6PM session -- fresh start, yesterday's
+#      snapshots are archived on disk but not loaded.
+#   3. Group clearshots by stranger label (parsed from filename:
+#      ..._STRANGER_Stranger_07_CLEARSHOT_03.png -> "Stranger_07").
+#   4. For each stranger:
+#      a. Load each clearshot PNG + sidecar .json (bbox coords).
+#      b. Crop the person region using the stored bbox.
+#      c. Compute OSNet 512-dim embedding for each crop.
+#      d. Consensus selection: the embedding with the most cosine-
+#         similarity "pairs" above consensus_threshold wins (medoid).
+#   5. Load the consensus embeddings into DualIndexManager._dynamic_strangers
+#      (in-memory only -- NOT persisted to .pickle/.pkl).
+#
+# The sidecar .json is written next to each clearshot PNG by
+# snap_strangers.py (_handle_write_clearshot). Format:
+#   {"bbox": [x1, y1, x2, y2], "track_id": 42, "stranger_label": "Stranger_07",
+#    "clearshot_idx": 3, "ts_ms": 1784207527614}
+# ------------------------------------------------------------------------------
+stranger_recall:
+  enabled: true
+  # Root directory of clearshots (mirrors snap_strangers.output_dir).
+  clearshot_dir: "storage/snap_strangers"
+  # Cosine similarity threshold for consensus pair counting.
+  # 0.70 matches identity_matcher.hybrid_reid.body_similarity_threshold.
+  # An embedding "pairs" with another if cos_sim >= this value.
+  # Higher = stricter (fewer pairs, picks the tightest cluster center).
+  # Lower = looser (more pairs, picks the most "average" embedding).
+  consensus_threshold: 0.70
+  # Maximum clearshots to load per stranger. If a stranger has more
+  # clearshots than this, only the most recent N are loaded (sorted by
+  # ts_ms in filename). Prevents a single stranger with 1000 clearshots
+  # from dominating recall startup time. 20 matches
+  # snap_strangers.clearshot.max_per_track.
+  max_clearshots_per_stranger: 20
+  # Margin (pixels) added around the stored bbox when cropping. Helps
+  # preserve body context that OSNet uses for re-identification. 10px
+  # is ~8% of a 128px-wide person crop at 1280x720 resolution.
+  crop_margin_px: 10
+
+enrollment:
+  student_faces_dir: "data/student_faces"
+  db_pickle_path: "data/student_db.pickle"
+  anchor_capacity: 1
+  distribution_cluster_capacity: 34
+  total_profile_capacity: 35                  # Anchor + 24 distribution frames
+  image_extensions: [".jpg", ".jpeg", ".png"]
+  image_filename_pattern: "frame_\\d{6}\\.jpg"
+  # ArcFace standard 112x112 5-point landmark template.
+  arcface_template:
+    - [38.2946, 51.6963]                      # Left eye
+    - [73.5318, 51.5014]                      # Right eye
+    - [56.0252, 71.7366]                      # Nose
+    - [41.5493, 92.3655]                      # Left mouth corner
+    - [70.7299, 92.2041]                      # Right mouth corner
+  alignment_method: "LMEDS"                   # cv2.LMEDS via estimateAffinePartial2D
+  warp_interpolation: "INTER_LINEAR"
+  warp_border_mode: "BORDER_REPLICATE"
+  normalization:
+    method: "insightface_native"
+    subtract: 127.5
+    divide: 128.0
+  enable_gc_collect_per_profile: true
+  # Patch 12: Registration engine uses a LARGER det_size than the live
+  # engine to produce higher-quality embeddings per pose. The live engine
+  # in main.py stays at insightface.det_size (320x320) for speed; this
+  # value is ONLY used by scripts/enroll.py when constructing the
+  # registration _LightFaceEngine instance.
+  registration_det_size: [640, 640]
+  # Patch 12: Distribution-frame selection strategy. We compute BOTH
+  # L2 deviation (geometric distance from anchor 5-point landmarks)
+  # AND a yaw-aware score (eye-nose asymmetry). L2 deviation acts as a
+  # RANGE FILTER -- frames that are too close (near-duplicates of the
+  # anchor) or too far (likely misdetections / extreme pitch) are
+  # excluded. Within the surviving range, frames are sorted by yaw score
+  # DESCENDING so the 24 most profile-like views are picked first.
+  distribution_selection:
+    # L2 deviation filter (in pixels, computed on the 5-point kps).
+    # l2_min: skip near-duplicates of the anchor (no useful pose
+    #         variance; wastes a cluster slot).
+    # l2_max: skip frames whose kps deviate too far from the anchor
+    #         (likely misdetections, extreme pitch, or wrong subject).
+    l2_min_px: 5.0
+    l2_max_px: 60.0
+    # Yaw metric: |d_left_eye_to_nose - d_right_eye_to_nose|, identical
+    # to the symmetry_score used for anchor selection but used here as a
+    # SORT KEY (descending = most profile-like first).
+    yaw_metric: "eye_nose_asymmetry"
+    sort_by: "yaw_desc"                       # Highest yaw score first
+    # Fallback if the L2-filtered set has fewer than distribution_capacity
+    # frames: relax the L2 filter (multiply l2_max by relax_l2_multiplier)
+    # and pick by pure yaw descending.
+    fallback_strategy: "relax_l2"             # "relax_l2" | "pure_l2_desc" | "pure_yaw_desc"
+    relax_l2_multiplier: 1.5                  # Multiply l2_max by 1.5 on fallback
+
+# ------------------------------------------------------------------------------
+# 12. DASHBOARD (Streamlit UI Process)
+# ------------------------------------------------------------------------------
+dashboard:
+  host: "127.0.0.1"
+  port: 8501
+  udp_metrics_port: 9999                      # Performance Monitor inbound
+  udp_buffer_bytes: 65536
+  columns:
+    - "performance_monitor"
+    - "live_attendance_journal"
+    - "stranger_alert_gallery"
+  # Patch 60 :: Raised from 1000 -> 2000 per operator request
+  # ("lazier loading, over 2 seconds instead for the update for
+  # stability"). The 1s refresh was creating GC pressure on the
+  # dashboard process (each rerun materializes ~17 MB of transient
+  # objects -- history list, pandas df, 6 matplotlib figures). At
+  # 2s cadence the transient spike is halved and the allocator has
+  # time to settle between renders.
+  refresh_interval_ms: 2000
+  # Patch 63 (hotfix K) :: Raised from 24 -> 200 -> 1000.
+  # The previous cap of 24 meant that in sessions with many strangers
+  # (e.g. a busy hallway), strangers 25+ were saved to disk but hidden
+  # from the gallery. The operator requested "show ALL strangers that
+  # appeared in the session, not just the first 24".
+  # 1000 effectively removes the cap for any realistic session while
+  # still bounding pathological cases (e.g. a runaway detector that
+  # never reuses track IDs). At ~200KB per thumbnail, 1000 entries is
+  # ~200MB of PIL-decoded images -- large but tolerable on operator
+  # workstations. Set to 0 for truly unlimited.
+  max_stranger_thumbnails: 1000
+
+# ------------------------------------------------------------------------------
+# 13. MAIN ORCHESTRATOR (Quad-Threaded Bootstrap)
+# ------------------------------------------------------------------------------
+main:
+  ai_queue_maxsize: 2                         # Strict latest-frame dropping policy
+  ai_queue_timeout_ms: 50
+  render_fps_target: 60
+  enable_deterministic_timestamping: true
+  # P2-M14+M16 fix: removed `timestamp_source` and `dll_directories` -- both
+  # were dead config (no code reads `timestamp_source`; `dll_directories`
+  # was hardcoded to CUDA v12.4 paths that break on any CUDA upgrade, and
+  # gpu_linker.py gracefully falls back to an empty list when the key is
+  # absent). On Windows, gpu_linker.py auto-probes %CUDA_PATH% and the
+  # standard site-packages/nvidia/* layout, so explicit paths are no longer
+  # needed for the default install.
+  # Bounding box rendering policy.
+  render:
+    anti_alias: true
+    box_thickness: 2
+    font_scale: 0.6
+    font_face: "FONT_HERSHEY_SIMPLEX"
+    # Patch 59 :: Bbox render throttle. Draw bboxes on every Nth frame
+    # only; in-between frames reuse the last annotated frame from
+    # cache. This halves (N=2) or thirds (N=3) the cv2.rectangle /
+    # cv2.putText workload on the AI thread, improving stability
+    # without visible degradation (bboxes are still fresh enough for
+    # operator situational awareness). Set to 1 to disable throttling.
+    bbox_render_every_n_frames: 2
+    # Patch 61 :: TTFM recovery throttles. All cycle counts refer to
+    # AI thread cycles (frames_processed), not camera frames.
+    # Anomaly scan: run _scan_for_anomalies on every Nth AI cycle
+    # only (default 10 -> ~5Hz at 50fps AI). Cuts ~38ms/cycle on
+    # sparse scenes, which is exactly the TTFM-critical case.
+    anomaly_scan_every_n_cycles: 10
+    # Telemetry: broadcast UDP packet on every Nth AI cycle only
+    # (default 5 -> ~10Hz at 50fps AI). Dashboard graphs don't need
+    # 50Hz updates; 10Hz is plenty for human-readable trends.
+    telemetry_broadcast_every_n_cycles: 5
+    # VRAM query: torch.cuda.memory_allocated is a CUDA runtime API
+    # call that can stutter to 5-10ms under GPU contention. Query it
+    # on every Mth *broadcast* (not every cycle), so VRAM updates at
+    # ~1Hz when broadcast_every=5 and vram_every=6 (5*6=30 cycles).
+    telemetry_vram_every_n_broadcasts: 6
+    # 4x face-detect retry: when first-pass face detection fails AND
+    # crop_h>=60, retry at 4x INTER_CUBIC upscale (~80ms InsightFace
+    # call). Gate to every Nth *scan attempt* (not cycle) so the
+    # retry fires on the first scan of a new track (preserves TTFM
+    # recovery path) but skips 2/3 of subsequent failed scans.
+    face_retry_every_n_scans: 3
+    label_states:
+      verified_student: "[{nrp} / {name}]"
+      stranger: "[Stranger_{idx:02d}]"
+      anomaly: "[ANOMALY]"
+  # Once a track hits verified state, suspend all scanning loops.
+  freeze_verified_tracks: true
+  freeze_stranger_tracks: true
+
+# ------------------------------------------------------------------------------
+# 14. SESSION ROTATION (Patch 20 :: 12h boundary watcher)
+# ------------------------------------------------------------------------------
+# The SessionBoundaryWatcher thread in main.py polls local time every
+# 60s. On every 06:00 and 18:00 LOCAL crossing, it fires rotation
+# hooks on three engines:
+#
+#   1. async_logger.rotate_session(label, date)
+#      -> Closes the current CSV handle and opens a new file for the
+#         new half-day session:
+#           logs/attendance_{YYYY-MM-DD}_06AM.csv  (06:00-18:00 session)
+#           logs/attendance_{YYYY-MM-DD}_06PM.csv  (18:00-06:00 session)
+#         The date reflects the day the session STARTED on (so the
+#         overnight 6PM session is filed under the 18:00 date, not
+#         split at midnight).
+#
+#   2. snap_strangers.rotate_session(label, date)
+#      -> No-op. Per-snapshot folder routing is already automatic
+#         via _session_subdir_for_ts(capture_us). Existing files on
+#         disk are NEVER moved or deleted.
+#         Folder layout:
+#           snap_strangers/{YYYY-MM-DD}/6AM Session/*.png
+#           snap_strangers/{YYYY-MM-DD}/6PM Session/*.png
+#
+#   3. identity_matcher.reset_dynamic_memory()
+#      -> Clears the OSNet body-Re-ID dynamic stranger cache (USearch
+#         index + label map + per-track body_feature_history for
+#         non-verified tracks). Strangers get fresh Stranger_XX IDs
+#         in the new session. The static student face DB and all
+#         VERIFIED_STUDENT track states are PRESERVED.
+#
+# The watcher also pushes a `session_change` telemetry packet so the
+# dashboard can refresh its session selector immediately.
+# ------------------------------------------------------------------------------
+session_rotation:
+  enabled: true
+  am_hour: 6        # 06:00 local = start of AM session
+  pm_hour: 18       # 18:00 local = start of PM session
+  # P2-M14 fix: removed `tz` and `poll_interval_s` -- both were dead config.
+  # main.py:SessionBoundaryWatcher hardcodes tz_local=True (always uses OS
+  # timezone) and POLL_INTERVAL_S=60.0 (class constant). To change either,
+  # edit main.py -- the config keys were misleading operators into thinking
+  # they were configurable.
+
+# ------------------------------------------------------------------------------
+# 14b. CLASS SCHEDULING & ATTENDANCE (Patch :: 2026-07-20)
+# ------------------------------------------------------------------------------
+# Defines the daily-recurring class schedule. Each slot has a subject name,
+# a time window, and a reference to a student-list file (plain text, one
+# student ID per line) stored under `student_lists_dir`.
+#
+# ATTENDANCE WINDOW SEMANTICS:
+#   effective_window = [start_time - grace_minutes, end_time)
+#   - grace_minutes (default 10): students entering up to N minutes
+#     BEFORE the slot starts are counted as attended (early grace).
+#   - End time is STRICT: students entering AT or AFTER end_time do
+#     NOT count (no late entry).
+#   - Outside any slot's effective window = FREE PERIOD (no attendance
+#     impact; presence is still logged via the existing async_logger).
+#
+# NO-MAKE-UP RULE:
+#   A student expected in Slot B cannot enter during Slot A's window to
+#   "make up" attendance for Slot B. Each slot's attendance is evaluated
+#   independently against that slot's effective window only.
+#
+# EDIT-LOCK DURING ACTIVE SLOT:
+#   The dashboard blocks edits to a slot whose effective window is
+#   currently active. Other slots can still be edited.
+#
+# STUDENT LISTS:
+#   One .txt file per slot under `student_lists_dir`. Each line is a
+#   student ID (e.g. "2024015"). Lines starting with '#' are comments.
+#   The dashboard can upload/override/delete these files.
+#
+# ATTENDANCE CSVs:
+#   main.py writes one CSV per (date, slot) under `attend_csv_dir`:
+#     attendance_{YYYY-MM-DD}_{slot_id}.csv  (expected + attended students)
+#     strangers_{YYYY-MM-DD}_{slot_id}.csv   (strangers seen during slot)
+#   The dashboard polls these files every 10s for live updates.
+# ----------------------------------------------------------------------------
+class_scheduling:
+  enabled: true
+  # Daily-recurring slot template (same slots every day).
+  # Editable via the Streamlit "Schedule" tab; persisted back to this file.
+  slots:
+    - slot_id: "slot_1"
+      subject_name: "IoT"
+      start_time: "07:00"          # HH:MM 24-hour, local time
+      end_time:   "10:00"
+      expected_students_file: "storage/student_lists/slot_1.txt"
+    - slot_id: "slot_2"
+      subject_name: "AI"
+      start_time: "10:00"
+      end_time:   "12:00"
+      expected_students_file: "storage/student_lists/slot_2.txt"
+    - slot_id: "slot_3"
+      subject_name: "Web Design"
+      start_time: "13:00"
+      end_time:   "15:00"
+      expected_students_file: "storage/student_lists/slot_3.txt"
+  # Minutes of early grace (entering before start_time still counts).
+  grace_minutes: 10
+  # Storage dirs (created on demand if missing).
+  student_lists_dir:  "storage/student_lists"
+  attend_csv_dir:      "storage/attend_csv"
+  attendance_reports_dir: "storage/attendance_reports"
+  # Polling cadence for the dashboard's Live Attendance tab.
+  dashboard_poll_interval_s: 10
+
+# ------------------------------------------------------------------------------
+# 15. SUPERVISOR (start_sortendance.py)
+# ------------------------------------------------------------------------------
+# ONE Python script supervises BOTH main.py and dashboard.py:
+#   - Spawns both as child processes
+#   - At every 06:00 / 18:00 LOCAL boundary (read from session_rotation
+#     above), kills both and respawns fresh ones -- releases all memory
+#     (ONNX arenas, CUDA contexts, Streamlit caches, Python heap)
+#   - Restarts either child individually if it crashes
+#   - Cleanly kills both on Ctrl+C
+#
+# Usage:
+#   python start_sortendance.py              # run BOTH main + dashboard
+#   python start_sortendance.py main         # run only main.py
+#   python start_sortendance.py dashboard    # run only dashboard.py
+#   python start_sortendance.py --dry-run    # preview schedule
+#
+# Launchers (all delegate to start_sortendance.py):
+#   Windows:  start_sortendance.bat   (both)  |  run_main.bat   |  run_dashboard.bat
+#   Linux:    ./start_sortendance.sh  (both)  |  ./run_main.sh  |  ./run_dashboard.sh
+#
+# AUTO-START ON BOOT:
+#   Windows: copy start_sortendance.bat (or a shortcut) to  shell:startup
+#   Linux:   crontab -e  ->  @reboot cd /path/to/project && ./start_sortendance.sh
+#
+# No separate config block is needed -- start_sortendance.py reads the
+# existing session_rotation.am_hour / pm_hour values above. Defaults to
+# 6 / 18 if config.yaml is missing or unreadable.
+# ------------------------------------------------------------------------------
+
